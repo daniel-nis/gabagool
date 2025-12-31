@@ -14,7 +14,6 @@ sys.path.insert(0, '..')
 
 from helpers.polymarket_api import Market, get_15m_markets
 from helpers.orderbook_wss import OrderbookStreamer, OrderbookState
-from helpers.price_feed import get_price_with_history, PriceState
 
 from sniper.models import SnipeTrade, SnipeOpportunity, TradeStore
 from sniper import config
@@ -35,19 +34,16 @@ class MarketState:
     expected_roi: Optional[float] = None
     can_enter: bool = False
     skip_reason: Optional[str] = None
-    price_state: Optional[PriceState] = None
-    price_confirms: Optional[bool] = None
 
 
 class SnipeEngine:
     """
     Late-Game Snipe Engine.
 
-    Monitors 15-min markets and executes snipe trades when conditions are met:
+    Monitors 15-min Polymarket markets and executes snipe trades when conditions are met:
     - Time remaining: 10-60 seconds
     - Leader price: 70-92%
     - Expected ROI: 8%+
-    - Optional: Binance confirms direction
     """
 
     def __init__(self, trade_store: TradeStore = None):
@@ -57,7 +53,6 @@ class SnipeEngine:
         # Current state
         self.markets: Dict[str, Market] = {}
         self.market_states: Dict[str, MarketState] = {}
-        self.price_states: Dict[str, PriceState] = {}  # Asset -> current price state
 
         # Tracking
         self.active_trades: Dict[str, SnipeTrade] = {}  # market_id -> trade
@@ -208,23 +203,6 @@ class SnipeEngine:
             state.skip_reason = f"Spread too wide ({leader_spread:.1%})"
             return state
 
-        # Price confirmation (optional)
-        if config.REQUIRE_BINANCE_CONFIRMATION:
-            price_state = self.price_states.get(market.asset)
-            state.price_state = price_state
-
-            if price_state and price_state.direction:
-                # Does Polymarket leader match spot price direction?
-                if leader == price_state.direction:
-                    state.price_confirms = True
-                else:
-                    state.price_confirms = False
-                    state.skip_reason = f"Spot price disagrees ({price_state.direction})"
-                    return state
-            else:
-                # No price data, skip confirmation
-                state.price_confirms = None
-
         # All checks passed - can enter
         state.can_enter = True
         return state
@@ -246,7 +224,6 @@ class SnipeEngine:
             shares=shares,
             cost=cost,
             time_remaining_at_entry=state.time_remaining,
-            binance_confirmed=state.price_confirms,
         )
 
         # Save to DB
@@ -354,20 +331,6 @@ class SnipeEngine:
 
             await asyncio.sleep(config.MARKET_REFRESH_INTERVAL)
 
-    async def _refresh_prices(self):
-        """Periodically refresh spot price data."""
-        while self.running:
-            try:
-                for asset in config.ASSETS:
-                    state = get_price_with_history(asset)
-                    if state:
-                        self.price_states[asset] = state
-
-            except Exception as e:
-                print(f"Price refresh error: {e}")
-
-            await asyncio.sleep(15)  # Every 15 seconds (CoinGecko rate limit friendly)
-
     async def _tick(self):
         """Main evaluation loop."""
         while self.running:
@@ -392,9 +355,6 @@ class SnipeEngine:
                         spread=state.up_spread if state.leader == "UP" else state.down_spread,
                         entered=state.can_enter,
                         skip_reason=state.skip_reason,
-                        binance_price=state.price_state.price if state.price_state else None,
-                        binance_direction=state.price_state.direction if state.price_state else None,
-                        binance_confirms=state.price_confirms,
                     )
 
                     # Save every opportunity in snipe zone for analysis
@@ -421,7 +381,6 @@ class SnipeEngine:
         print(f"Leader range: {config.MIN_LEADER_PRICE:.0%}-{config.MAX_LEADER_PRICE:.0%}")
         print(f"Min ROI: {config.MIN_EXPECTED_ROI:.0%}")
         print(f"Trade size: ${config.TRADE_SIZE}")
-        print(f"Binance confirmation: {config.REQUIRE_BINANCE_CONFIRMATION}")
         print("="*60 + "\n")
 
         # Load any unresolved trades
@@ -432,7 +391,6 @@ class SnipeEngine:
         await asyncio.gather(
             self.orderbook.stream(),
             self._refresh_markets(),
-            self._refresh_prices(),
             self._tick(),
         )
 

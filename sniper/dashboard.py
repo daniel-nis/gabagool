@@ -200,17 +200,6 @@ DASHBOARD_HTML = '''
             transition: width 0.3s;
         }
 
-        /* Binance indicator */
-        .binance-confirm {
-            display: inline-block;
-            padding: 2px 6px;
-            border-radius: 3px;
-            font-size: 10px;
-            margin-left: 5px;
-        }
-        .binance-yes { background: #4ade80; color: #000; }
-        .binance-no { background: #f87171; color: #000; }
-        .binance-na { background: #333; color: #888; }
     </style>
 </head>
 <body>
@@ -348,11 +337,6 @@ DASHBOARD_HTML = '''
                     statusText = m.skip_reason || 'In Zone';
                 }
 
-                const binanceClass = m.binance_confirms === true ? 'binance-yes' :
-                                    m.binance_confirms === false ? 'binance-no' : 'binance-na';
-                const binanceText = m.binance_confirms === true ? 'Confirmed' :
-                                   m.binance_confirms === false ? 'Divergent' : 'N/A';
-
                 html += `
                 <div class="${cardClass}">
                     <div class="market-header">
@@ -373,7 +357,6 @@ DASHBOARD_HTML = '''
                     <div style="text-align:center;margin:10px 0;">
                         <span style="color:#888;">Leader:</span>
                         <span style="color:${m.leader === 'UP' ? '#4ade80' : '#f87171'};font-weight:bold;">${m.leader}</span>
-                        <span class="binance-confirm ${binanceClass}">${binanceText}</span>
                     </div>
                     ${m.expected_roi ? `
                     <div style="text-align:center;font-size:12px;color:#888;">
@@ -494,7 +477,6 @@ def emit_state():
             'leader_price': state.leader_price,
             'expected_roi': state.expected_roi,
             'skip_reason': state.skip_reason,
-            'binance_confirms': state.price_confirms,
             'traded': cid in engine.traded_markets,
         }
     socketio.emit('markets', markets_data)

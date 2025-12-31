@@ -20,11 +20,8 @@ MIN_EXPECTED_ROI = 0.08        # Minimum 8% expected ROI
 # Spread filter (illiquidity protection)
 MAX_SPREAD = 0.05              # Skip if spread > 5% (abnormal)
 
-# Spot price confirmation (uses CoinGecko)
-REQUIRE_BINANCE_CONFIRMATION = False  # Require spot price to confirm Polymarket direction
-
-# Assets to trade
-ASSETS = ["BTC", "ETH"]
+# Assets to trade (all available 15-min markets)
+ASSETS = ["BTC", "ETH", "SOL", "XRP"]
 
 # Timing
 TICK_INTERVAL = 0.5            # Seconds between price checks
