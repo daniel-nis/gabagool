@@ -3,7 +3,7 @@
 Gabagool Paper Trading Engine.
 
 Features:
-- Polls for new 15-min markets every minute
+- Predictive market discovery - polls at exact 15-min boundaries
 - Streams prices via WebSocket
 - Simulates fills at mid-price (no slippage for paper)
 - Tracks positions in SQLite for persistence
@@ -14,13 +14,37 @@ import asyncio
 import csv
 import sqlite3
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Callable
 from pathlib import Path
 
 from helpers import get_15m_markets, OrderbookStreamer, Market
 from strategies import GabagoolStrategy, GabagoolAction
+
+
+def get_next_15m_boundary() -> datetime:
+    """Calculate the next 15-minute boundary (00, 15, 30, 45 minutes)."""
+    now = datetime.now(timezone.utc)
+    # Current minute
+    current_minute = now.minute
+    # Next 15-min boundary
+    next_boundary_minute = ((current_minute // 15) + 1) * 15
+
+    if next_boundary_minute >= 60:
+        # Roll over to next hour
+        next_boundary = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    else:
+        next_boundary = now.replace(minute=next_boundary_minute, second=0, microsecond=0)
+
+    return next_boundary
+
+
+def seconds_until_next_boundary() -> float:
+    """Get seconds until next 15-min boundary."""
+    now = datetime.now(timezone.utc)
+    next_boundary = get_next_15m_boundary()
+    return (next_boundary - now).total_seconds()
 
 
 @dataclass
@@ -481,20 +505,46 @@ class GabagoolEngine:
         del self.markets[market_id]
 
     async def decision_loop(self):
-        """Main trading decision loop."""
+        """Main trading decision loop with predictive market scheduling."""
         tick = 0
-        last_refresh = 0
+        last_boundary_check = None
+        aggressive_poll_until = None  # Track when to stop aggressive polling
 
         while self.running:
             await asyncio.sleep(self.config.tick_interval)
             tick += 1
             now = datetime.now(timezone.utc)
 
-            # Refresh markets periodically
-            elapsed = tick * self.config.tick_interval
-            if elapsed - last_refresh >= self.config.market_refresh_interval:
+            # Predictive scheduling: check for new markets at 15-min boundaries
+            current_boundary = now.replace(second=0, microsecond=0)
+            current_boundary = current_boundary.replace(minute=(now.minute // 15) * 15)
+
+            seconds_into_window = (now - current_boundary).total_seconds()
+            should_refresh = False
+
+            # Check if we crossed into a new 15-min window
+            if last_boundary_check != current_boundary:
+                if seconds_into_window >= 2:
+                    last_boundary_check = current_boundary
+                    # Start aggressive polling for 60 seconds after boundary
+                    aggressive_poll_until = current_boundary + timedelta(seconds=60)
+                    print(f"\n[{now.strftime('%H:%M:%S')}] New 15-min window! Aggressive polling for 60s...")
+                    should_refresh = True
+
+            # Aggressive polling: every 5 seconds for 60s after boundary
+            if aggressive_poll_until and now < aggressive_poll_until:
+                if tick % 10 == 0:  # Every 5 seconds (10 ticks * 0.5s)
+                    market_count = len(self.markets)
+                    self.refresh_markets()
+                    new_count = len(self.markets)
+                    if new_count > market_count:
+                        print(f"  Found {new_count - market_count} new market(s)!")
+                        aggressive_poll_until = None  # Stop aggressive polling
+            elif aggressive_poll_until and now >= aggressive_poll_until:
+                aggressive_poll_until = None  # Done with aggressive polling
+
+            if should_refresh:
                 self.refresh_markets()
-                last_refresh = elapsed
 
             # Check expired markets
             expired = [cid for cid, m in self.markets.items() if m.end_time <= now]
@@ -656,14 +706,21 @@ class GabagoolEngine:
     async def run(self):
         """Run the trading engine."""
         self.running = True
+
+        # Show next 15-min boundary
+        next_boundary = get_next_15m_boundary()
+        secs_until = seconds_until_next_boundary()
+        print(f"\n  Next 15-min window: {next_boundary.strftime('%H:%M:%S')} UTC ({secs_until:.0f}s)")
+
         self.refresh_markets()
 
         if not self.markets:
-            print("No markets to trade!")
-            print("Waiting for markets...")
-            while self.running and not self.markets:
-                await asyncio.sleep(30)
-                self.refresh_markets()
+            print("No active markets - waiting for next 15-min window...")
+            # Wait until just after the next boundary
+            wait_time = min(secs_until + 3, 30)  # Wait max 30s, or until boundary + 3s
+            print(f"  Checking again in {wait_time:.0f}s...")
+            await asyncio.sleep(wait_time)
+            self.refresh_markets()
 
         # Start orderbook streaming and decision loop
         tasks = [
