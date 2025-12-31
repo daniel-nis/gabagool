@@ -6,7 +6,7 @@ Real-time monitoring dashboard for the snipe strategy.
 import asyncio
 from datetime import datetime, timezone
 from threading import Thread
-from flask import Flask, render_template_string
+from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO
 
 from sniper.engine import SnipeEngine, MarketState
@@ -48,6 +48,29 @@ DASHBOARD_HTML = '''
         }
         .container { max-width: 1400px; margin: 0 auto; }
 
+        /* Header with mode badge */
+        .header {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .mode-badge {
+            padding: 6px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        .mode-observe {
+            background: #fbbf24;
+            color: #000;
+        }
+        .mode-trade {
+            background: #4ade80;
+            color: #000;
+        }
+
         /* Header Stats */
         .stats-grid {
             display: grid;
@@ -73,6 +96,112 @@ DASHBOARD_HTML = '''
             color: #888;
             font-size: 12px;
             margin-top: 5px;
+        }
+
+        /* Settings Panel */
+        .settings-panel {
+            background: #1a1a1a;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .settings-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+            gap: 15px;
+        }
+        .setting-item {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        .setting-item label {
+            color: #888;
+            font-size: 11px;
+            text-transform: uppercase;
+        }
+        .setting-item input[type="number"] {
+            background: #252525;
+            border: 1px solid #444;
+            border-radius: 4px;
+            padding: 8px 12px;
+            color: #fff;
+            font-family: inherit;
+            font-size: 14px;
+        }
+        .setting-item input[type="number"]:focus {
+            outline: none;
+            border-color: #ff6b35;
+        }
+        .toggle-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .toggle {
+            position: relative;
+            width: 50px;
+            height: 26px;
+        }
+        .toggle input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .toggle-slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background-color: #333;
+            transition: 0.3s;
+            border-radius: 26px;
+        }
+        .toggle-slider:before {
+            position: absolute;
+            content: "";
+            height: 20px;
+            width: 20px;
+            left: 3px;
+            bottom: 3px;
+            background-color: #666;
+            transition: 0.3s;
+            border-radius: 50%;
+        }
+        .toggle input:checked + .toggle-slider {
+            background-color: #fbbf24;
+        }
+        .toggle input:checked + .toggle-slider:before {
+            transform: translateX(24px);
+            background-color: #000;
+        }
+        .toggle-label {
+            color: #888;
+            font-size: 12px;
+        }
+        .apply-btn {
+            background: #ff6b35;
+            color: #000;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            font-weight: bold;
+            cursor: pointer;
+            font-family: inherit;
+            margin-top: 10px;
+        }
+        .apply-btn:hover {
+            background: #ff8555;
+        }
+        .settings-status {
+            color: #4ade80;
+            font-size: 12px;
+            margin-left: 10px;
+            opacity: 0;
+            transition: opacity 0.3s;
+        }
+        .settings-status.show {
+            opacity: 1;
         }
 
         /* Markets Panel */
@@ -152,6 +281,7 @@ DASHBOARD_HTML = '''
         .status-waiting { background: #333; color: #888; }
         .status-snipe-zone { background: #ff6b35; color: #000; }
         .status-can-enter { background: #4ade80; color: #000; font-weight: bold; }
+        .status-observe { background: #fbbf24; color: #000; font-weight: bold; }
         .status-traded { background: #3b82f6; color: #fff; }
         .status-skipped { background: #6b7280; color: #fff; }
 
@@ -185,26 +315,63 @@ DASHBOARD_HTML = '''
             grid-template-columns: 1fr 1fr;
             gap: 20px;
         }
-
-        /* ROI indicator */
-        .roi-bar {
-            height: 4px;
-            background: #333;
-            border-radius: 2px;
-            margin-top: 5px;
-            overflow: hidden;
-        }
-        .roi-fill {
-            height: 100%;
-            background: linear-gradient(90deg, #ff6b35, #4ade80);
-            transition: width 0.3s;
-        }
-
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>LATE-GAME SNIPER</h1>
+        <div class="header">
+            <h1>LATE-GAME SNIPER</h1>
+            <span class="mode-badge" id="mode-badge">OBSERVE</span>
+        </div>
+
+        <!-- Settings Panel -->
+        <div class="settings-panel">
+            <h2>Settings (Hot Reload)</h2>
+            <div class="settings-grid">
+                <div class="setting-item">
+                    <label>Min Time (sec)</label>
+                    <input type="number" id="min_time_remaining" min="1" max="300" step="1">
+                </div>
+                <div class="setting-item">
+                    <label>Max Time (sec)</label>
+                    <input type="number" id="max_time_remaining" min="10" max="900" step="1">
+                </div>
+                <div class="setting-item">
+                    <label>Min Leader Price</label>
+                    <input type="number" id="min_leader_price" min="0.5" max="0.99" step="0.01">
+                </div>
+                <div class="setting-item">
+                    <label>Max Leader Price</label>
+                    <input type="number" id="max_leader_price" min="0.5" max="0.99" step="0.01">
+                </div>
+                <div class="setting-item">
+                    <label>Min Expected ROI</label>
+                    <input type="number" id="min_expected_roi" min="0.01" max="0.5" step="0.01">
+                </div>
+                <div class="setting-item">
+                    <label>Trade Size ($)</label>
+                    <input type="number" id="trade_size" min="1" max="1000" step="1">
+                </div>
+                <div class="setting-item">
+                    <label>Max Spread</label>
+                    <input type="number" id="max_spread" min="0.01" max="0.2" step="0.01">
+                </div>
+                <div class="setting-item">
+                    <label>Observation Mode</label>
+                    <div class="toggle-container">
+                        <label class="toggle">
+                            <input type="checkbox" id="observation_mode">
+                            <span class="toggle-slider"></span>
+                        </label>
+                        <span class="toggle-label" id="obs-label">Log only</span>
+                    </div>
+                </div>
+            </div>
+            <div style="margin-top: 15px; display: flex; align-items: center;">
+                <button class="apply-btn" onclick="applySettings()">Apply Changes</button>
+                <span class="settings-status" id="settings-status">Settings saved!</span>
+            </div>
+        </div>
 
         <!-- Stats -->
         <div class="stats-grid">
@@ -225,8 +392,8 @@ DASHBOARD_HTML = '''
                 <div class="stat-label">Total Trades</div>
             </div>
             <div class="stat-card">
-                <div class="stat-value" id="active-positions">0</div>
-                <div class="stat-label">Active Positions</div>
+                <div class="stat-value" id="pending-obs">0</div>
+                <div class="stat-label">Pending Obs</div>
             </div>
         </div>
 
@@ -289,11 +456,31 @@ DASHBOARD_HTML = '''
 
     <script>
         const socket = io();
-        let serverTimeOffset = 0;
+        let currentSettings = {};
 
         socket.on('connect', () => {
             console.log('Connected to server');
             socket.emit('request_state');
+            socket.emit('request_settings');
+        });
+
+        socket.on('settings', (settings) => {
+            currentSettings = settings;
+            document.getElementById('min_time_remaining').value = settings.min_time_remaining;
+            document.getElementById('max_time_remaining').value = settings.max_time_remaining;
+            document.getElementById('min_leader_price').value = settings.min_leader_price;
+            document.getElementById('max_leader_price').value = settings.max_leader_price;
+            document.getElementById('min_expected_roi').value = settings.min_expected_roi;
+            document.getElementById('trade_size').value = settings.trade_size;
+            document.getElementById('max_spread').value = settings.max_spread;
+            document.getElementById('observation_mode').checked = settings.observation_mode;
+            updateModeDisplay(settings.observation_mode);
+        });
+
+        socket.on('settings_updated', () => {
+            const status = document.getElementById('settings-status');
+            status.classList.add('show');
+            setTimeout(() => status.classList.remove('show'), 2000);
         });
 
         socket.on('stats', (stats) => {
@@ -305,11 +492,15 @@ DASHBOARD_HTML = '''
             document.getElementById('win-rate').textContent = ((stats.win_rate || 0) * 100).toFixed(0) + '%';
             document.getElementById('avg-roi').textContent = ((stats.avg_roi || 0) * 100).toFixed(1) + '%';
             document.getElementById('total-trades').textContent = stats.resolved_trades || 0;
-            document.getElementById('active-positions').textContent = stats.total_trades - (stats.resolved_trades || 0);
+            document.getElementById('pending-obs').textContent = stats.pending_observations || 0;
+
+            // Update mode badge
+            updateModeDisplay(stats.observation_mode);
         });
 
         socket.on('markets', (markets) => {
             const container = document.getElementById('markets-container');
+            const obsMode = document.getElementById('observation_mode').checked;
 
             if (Object.keys(markets).length === 0) {
                 container.innerHTML = '<div class="market-card"><div style="text-align:center;color:#888;padding:40px;">Waiting for markets...</div></div>';
@@ -324,9 +515,12 @@ DASHBOARD_HTML = '''
                 let statusText = 'Waiting';
 
                 if (m.traded) {
-                    cardClass += '';
                     statusClass = 'status-traded';
                     statusText = 'TRADED';
+                } else if (m.can_enter && obsMode) {
+                    cardClass += ' can-enter';
+                    statusClass = 'status-observe';
+                    statusText = 'WOULD ENTER (Observing)';
                 } else if (m.can_enter) {
                     cardClass += ' can-enter';
                     statusClass = 'status-can-enter';
@@ -415,7 +609,6 @@ DASHBOARD_HTML = '''
             `;
             tbody.insertBefore(row, tbody.firstChild);
 
-            // Keep only last 20
             while (tbody.children.length > 20) {
                 tbody.removeChild(tbody.lastChild);
             }
@@ -427,6 +620,40 @@ DASHBOARD_HTML = '''
             const secs = Math.floor(seconds % 60);
             return mins + ':' + secs.toString().padStart(2, '0');
         }
+
+        function updateModeDisplay(obsMode) {
+            const badge = document.getElementById('mode-badge');
+            const label = document.getElementById('obs-label');
+            if (obsMode) {
+                badge.textContent = 'OBSERVE';
+                badge.className = 'mode-badge mode-observe';
+                label.textContent = 'Log only';
+            } else {
+                badge.textContent = 'TRADING';
+                badge.className = 'mode-badge mode-trade';
+                label.textContent = 'Execute trades';
+            }
+        }
+
+        function applySettings() {
+            const settings = {
+                min_time_remaining: parseInt(document.getElementById('min_time_remaining').value),
+                max_time_remaining: parseInt(document.getElementById('max_time_remaining').value),
+                min_leader_price: parseFloat(document.getElementById('min_leader_price').value),
+                max_leader_price: parseFloat(document.getElementById('max_leader_price').value),
+                min_expected_roi: parseFloat(document.getElementById('min_expected_roi').value),
+                trade_size: parseFloat(document.getElementById('trade_size').value),
+                max_spread: parseFloat(document.getElementById('max_spread').value),
+                observation_mode: document.getElementById('observation_mode').checked
+            };
+            socket.emit('update_settings', settings);
+            updateModeDisplay(settings.observation_mode);
+        }
+
+        // Update observation mode display on toggle
+        document.getElementById('observation_mode').addEventListener('change', function() {
+            updateModeDisplay(this.checked);
+        });
 
         // Request periodic updates
         setInterval(() => {
@@ -446,11 +673,33 @@ def index():
 @socketio.on('connect')
 def handle_connect():
     emit_state()
+    emit_settings()
 
 
 @socketio.on('request_state')
 def handle_request_state():
     emit_state()
+
+
+@socketio.on('request_settings')
+def handle_request_settings():
+    emit_settings()
+
+
+@socketio.on('update_settings')
+def handle_update_settings(data):
+    global engine
+    if engine:
+        engine.update_settings(**data)
+        socketio.emit('settings_updated')
+        emit_settings()
+
+
+def emit_settings():
+    """Emit current settings to client."""
+    global engine
+    if engine:
+        socketio.emit('settings', engine.get_settings())
 
 
 def emit_state():
