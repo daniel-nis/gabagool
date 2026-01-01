@@ -359,6 +359,69 @@ class SnipeEngine:
 
         self._emit_trade(trade)
 
+    def _get_leader_price(self, market: Market) -> Optional[float]:
+        """Get current leader price from orderbook."""
+        ob_up = self.orderbook.get_orderbook(market.condition_id, "UP")
+        ob_down = self.orderbook.get_orderbook(market.condition_id, "DOWN")
+
+        up_price = ob_up.mid_price if ob_up and ob_up.mid_price else market.price_up
+        down_price = ob_down.mid_price if ob_down and ob_down.mid_price else market.price_down
+
+        if up_price is None and down_price is None:
+            return None
+
+        return max(up_price or 0, down_price or 0)
+
+    def _exit_trade_early(self, trade: SnipeTrade, exit_price: float, reason: str = "stop-loss"):
+        """Exit a trade early at current price."""
+        pnl = (trade.shares * exit_price) - trade.cost
+        roi = pnl / trade.cost
+
+        # Update in DB
+        self.store.resolve_trade(trade.id, exit_price, pnl, roi)
+
+        # Update local
+        trade.resolved = True
+        trade.exit_price = exit_price
+        trade.pnl = pnl
+        trade.roi = roi
+
+        # Remove from active trades
+        if trade.market_id in self.active_trades:
+            del self.active_trades[trade.market_id]
+
+        print(f"\n{'='*50}")
+        print(f"STOP-LOSS EXIT: {trade.asset}")
+        print(f"  Side: {trade.side}")
+        print(f"  Entry: {trade.entry_price:.1%}")
+        print(f"  Exit: {exit_price:.1%}")
+        print(f"  P&L: ${pnl:+.2f} (saved ${trade.cost - abs(pnl):.2f})")
+        print(f"  ROI: {roi:+.1%}")
+        print(f"{'='*50}\n")
+
+        self._emit_trade(trade)
+
+    def _monitor_stop_loss(self):
+        """Check active positions for stop-loss triggers."""
+        s = config.settings
+
+        for market_id, trade in list(self.active_trades.items()):
+            if trade.resolved:
+                continue
+
+            market = self.markets.get(market_id)
+            if not market:
+                continue
+
+            # Get current leader price from orderbook
+            current_leader = self._get_leader_price(market)
+            if current_leader is None:
+                continue
+
+            # Check if leader has dropped to stop-loss threshold
+            if current_leader <= s.stop_loss_threshold:
+                self._exit_trade_early(trade, current_leader, "stop-loss")
+
     async def _refresh_markets(self):
         """Periodically refresh market list."""
         while self.running:
@@ -473,6 +536,9 @@ class SnipeEngine:
                     # Execute if conditions met AND not in observation mode
                     if state.can_enter and not s.observation_mode:
                         self.execute_paper_trade(state)
+
+            # Monitor active positions for stop-loss
+            self._monitor_stop_loss()
 
             # Emit state update
             self._emit_update()

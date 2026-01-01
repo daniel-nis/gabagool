@@ -357,6 +357,10 @@ DASHBOARD_HTML = '''
                     <input type="number" id="max_spread" min="0.01" max="0.2" step="0.01">
                 </div>
                 <div class="setting-item">
+                    <label>Stop-Loss</label>
+                    <input type="number" id="stop_loss_threshold" min="0.4" max="0.7" step="0.05">
+                </div>
+                <div class="setting-item">
                     <label>Observation Mode</label>
                     <div class="toggle-container">
                         <label class="toggle">
@@ -473,6 +477,7 @@ DASHBOARD_HTML = '''
             document.getElementById('min_expected_roi').value = settings.min_expected_roi;
             document.getElementById('trade_size').value = settings.trade_size;
             document.getElementById('max_spread').value = settings.max_spread;
+            document.getElementById('stop_loss_threshold').value = settings.stop_loss_threshold;
             document.getElementById('observation_mode').checked = settings.observation_mode;
             updateModeDisplay(settings.observation_mode);
         });
@@ -644,6 +649,7 @@ DASHBOARD_HTML = '''
                 min_expected_roi: parseFloat(document.getElementById('min_expected_roi').value),
                 trade_size: parseFloat(document.getElementById('trade_size').value),
                 max_spread: parseFloat(document.getElementById('max_spread').value),
+                stop_loss_threshold: parseFloat(document.getElementById('stop_loss_threshold').value),
                 observation_mode: document.getElementById('observation_mode').checked
             };
             socket.emit('update_settings', settings);

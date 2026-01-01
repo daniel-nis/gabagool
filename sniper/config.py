@@ -31,6 +31,9 @@ class SnipeSettings:
     # Spread filter (illiquidity protection)
     max_spread: float = 0.05              # Skip if spread > this
 
+    # Stop-loss threshold
+    stop_loss_threshold: float = 0.50     # Exit if leader drops to this (50% = coin flip)
+
     # Observation mode - log without trading
     observation_mode: bool = True         # When True, only log opportunities
 
