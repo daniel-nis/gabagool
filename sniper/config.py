@@ -9,7 +9,7 @@ import os
 from dataclasses import dataclass, field, asdict
 from typing import List
 
-CONFIG_FILE = "sniper/data/config.json"
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "data", "config.json")
 
 
 @dataclass
@@ -45,7 +45,7 @@ class SnipeSettings:
 
     @classmethod
     def load(cls) -> 'SnipeSettings':
-        """Load settings from config file, or return defaults."""
+        """Load settings from config file, or return defaults and save them."""
         if os.path.exists(CONFIG_FILE):
             try:
                 with open(CONFIG_FILE, 'r') as f:
@@ -53,7 +53,10 @@ class SnipeSettings:
                 return cls(**data)
             except Exception as e:
                 print(f"Error loading config: {e}, using defaults")
-        return cls()
+        # Create config file with defaults if it doesn't exist
+        instance = cls()
+        instance.save()
+        return instance
 
     def update(self, **kwargs):
         """Update settings and save."""

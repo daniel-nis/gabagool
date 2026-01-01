@@ -650,9 +650,11 @@ DASHBOARD_HTML = '''
             updateModeDisplay(settings.observation_mode);
         }
 
-        // Update observation mode display on toggle
+        // Update observation mode immediately on toggle (no need to click Apply)
         document.getElementById('observation_mode').addEventListener('change', function() {
-            updateModeDisplay(this.checked);
+            const obsMode = this.checked;
+            updateModeDisplay(obsMode);
+            socket.emit('update_settings', { observation_mode: obsMode });
         });
 
         // Request periodic updates
