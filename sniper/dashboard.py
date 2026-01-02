@@ -357,8 +357,12 @@ DASHBOARD_HTML = '''
                     <input type="number" id="max_spread" min="0.01" max="0.2" step="0.01">
                 </div>
                 <div class="setting-item">
-                    <label>Stop-Loss</label>
+                    <label>Stop-Loss (Abs)</label>
                     <input type="number" id="stop_loss_threshold" min="0.4" max="0.7" step="0.05">
+                </div>
+                <div class="setting-item">
+                    <label>Stop-Loss (Drop)</label>
+                    <input type="number" id="stop_loss_drop" min="0.05" max="0.25" step="0.01">
                 </div>
                 <div class="setting-item">
                     <label>Observation Mode</label>
@@ -478,6 +482,7 @@ DASHBOARD_HTML = '''
             document.getElementById('trade_size').value = settings.trade_size;
             document.getElementById('max_spread').value = settings.max_spread;
             document.getElementById('stop_loss_threshold').value = settings.stop_loss_threshold;
+            document.getElementById('stop_loss_drop').value = settings.stop_loss_drop;
             document.getElementById('observation_mode').checked = settings.observation_mode;
             updateModeDisplay(settings.observation_mode);
         });
@@ -650,6 +655,7 @@ DASHBOARD_HTML = '''
                 trade_size: parseFloat(document.getElementById('trade_size').value),
                 max_spread: parseFloat(document.getElementById('max_spread').value),
                 stop_loss_threshold: parseFloat(document.getElementById('stop_loss_threshold').value),
+                stop_loss_drop: parseFloat(document.getElementById('stop_loss_drop').value),
                 observation_mode: document.getElementById('observation_mode').checked
             };
             socket.emit('update_settings', settings);

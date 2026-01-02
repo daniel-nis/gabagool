@@ -402,7 +402,7 @@ class SnipeEngine:
         self._emit_trade(trade)
 
     def _monitor_stop_loss(self):
-        """Check active positions for stop-loss triggers."""
+        """Check active positions for stop-loss triggers (dual system)."""
         s = config.settings
 
         for market_id, trade in list(self.active_trades.items()):
@@ -418,9 +418,15 @@ class SnipeEngine:
             if current_leader is None:
                 continue
 
-            # Check if leader has dropped to stop-loss threshold
+            # Check ABSOLUTE threshold: exit if leader drops to threshold
             if current_leader <= s.stop_loss_threshold:
-                self._exit_trade_early(trade, current_leader, "stop-loss")
+                self._exit_trade_early(trade, current_leader, "stop-loss-absolute")
+                continue
+
+            # Check RELATIVE drop: exit if price dropped too much from entry
+            drop_from_entry = trade.entry_price - current_leader
+            if drop_from_entry >= s.stop_loss_drop:
+                self._exit_trade_early(trade, current_leader, "stop-loss-relative")
 
     async def _refresh_markets(self):
         """Periodically refresh market list."""
