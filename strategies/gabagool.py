@@ -1,32 +1,25 @@
 """
-Gabagool Strategy - Asymmetric Scalping for Polymarket 15-min Crypto Binaries.
+Gabagool Strategy v4 - Opportunistic Dip-Buying for Polymarket 15-min Crypto Binaries.
 
-Goal: Accumulate positions where avg_cost_yes + avg_cost_no < 1.00
-      This creates "locked profit" - guaranteed profit regardless of outcome.
+Core Insight: Buy YES and NO dips independently, then match pairs to lock profit
+when combined cost < $1.00.
 
-How it works:
-1. Track moving average of YES and NO prices independently
-2. When YES price dips below MA * (1 - threshold), buy YES shares
-3. When NO price dips below MA * (1 - threshold), buy NO shares
-4. Each matched pair (1 YES + 1 NO) guarantees $1 payout
-5. If total cost < $1, profit is locked
+Example Flow:
+1. BTC YES dips to $0.45 → buy 22 shares ($10)
+2. 30s later, BTC NO dips to $0.48 → buy 20 shares ($10)
+3. FIFO match: 20 shares paired at $0.45 + $0.48 = $0.93
+4. Locked profit: 20 × $0.07 = $1.40 guaranteed
+5. Remaining: 2 unmatched YES shares (at risk until matched or sold)
 
-CRITICAL RULES (v2 - fixes for profitability):
-- Trade cooldown: minimum 30s between same-side trades
-- Balance priority: prefer buying under-represented side
-- Expiry awareness: stop trading when <3 min left
-- Longer MA: use 60+ periods for real dip detection
-
-Example:
-- Buy 10 YES shares at avg $0.45 = $4.50 total cost
-- Buy 10 NO shares at avg $0.48 = $4.80 total cost
-- Total cost: $9.30 for 10 matched pairs
-- Guaranteed payout: $10.00 (either YES or NO wins)
-- Locked profit: $0.70 (7.5% return)
+KEY RULES:
+1. Buy dips on either side independently
+2. Track unmatched shares separately from matched pairs
+3. FIFO matching when both sides have unmatched shares
+4. Close unmatched positions before expiry (sell back)
+5. Locked profit only for matched pairs with combined < $1
 """
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
-from collections import deque
 from datetime import datetime, timezone, timedelta
 from enum import Enum
 
@@ -36,198 +29,393 @@ class GabagoolAction(Enum):
     HOLD = "hold"
     BUY_YES = "buy_yes"
     BUY_NO = "buy_no"
+    SELL_YES = "sell_yes"  # Close unmatched near expiry
+    SELL_NO = "sell_no"    # Close unmatched near expiry
 
 
 @dataclass
-class GabagoolPosition:
-    """Position tracking for a single market."""
+class ShareLot:
+    """A single purchase lot for cost basis tracking (FIFO)."""
+    shares: float
+    price: float
+    timestamp: datetime
+
+    @property
+    def cost(self) -> float:
+        return self.shares * self.price
+
+
+@dataclass
+class DipBuyPosition:
+    """Tracks position with separate unmatched and matched tracking."""
     market_id: str
     asset: str
 
-    # YES side
-    shares_yes: float = 0.0
-    cost_yes: float = 0.0  # Total $ spent on YES
+    # Unmatched shares - FIFO queues
+    unmatched_yes_lots: List[ShareLot] = field(default_factory=list)
+    unmatched_no_lots: List[ShareLot] = field(default_factory=list)
 
-    # NO side
-    shares_no: float = 0.0
-    cost_no: float = 0.0  # Total $ spent on NO
+    # Matched pairs (locked profit)
+    matched_shares: float = 0.0
+    matched_cost_yes: float = 0.0
+    matched_cost_no: float = 0.0
+    locked_profit: float = 0.0
 
-    # Trade history for this market
+    # Price history for MA calculation
+    yes_price_history: List[Tuple[datetime, float]] = field(default_factory=list)
+    no_price_history: List[Tuple[datetime, float]] = field(default_factory=list)
+
+    # Cooldowns (separate for each side)
+    last_yes_trade_time: Optional[datetime] = None
+    last_no_trade_time: Optional[datetime] = None
+
+    # Trade history
     trades: List[dict] = field(default_factory=list)
 
-    # Cooldown tracking (v2)
-    last_yes_trade: datetime = None
-    last_no_trade: datetime = None
+    @property
+    def unmatched_yes_shares(self) -> float:
+        """Total unmatched YES shares."""
+        return sum(lot.shares for lot in self.unmatched_yes_lots)
 
     @property
-    def avg_price_yes(self) -> float:
-        """Average price paid per YES share."""
-        if self.shares_yes == 0:
+    def unmatched_no_shares(self) -> float:
+        """Total unmatched NO shares."""
+        return sum(lot.shares for lot in self.unmatched_no_lots)
+
+    @property
+    def unmatched_yes_cost(self) -> float:
+        """Total cost of unmatched YES shares."""
+        return sum(lot.cost for lot in self.unmatched_yes_lots)
+
+    @property
+    def unmatched_no_cost(self) -> float:
+        """Total cost of unmatched NO shares."""
+        return sum(lot.cost for lot in self.unmatched_no_lots)
+
+    @property
+    def total_cost(self) -> float:
+        """Total invested capital."""
+        return (self.unmatched_yes_cost + self.unmatched_no_cost +
+                self.matched_cost_yes + self.matched_cost_no)
+
+    @property
+    def unrealized_risk(self) -> float:
+        """Capital at risk (unmatched positions could lose everything)."""
+        return self.unmatched_yes_cost + self.unmatched_no_cost
+
+    @property
+    def matched_combined_cost(self) -> float:
+        """Combined cost per matched share."""
+        if self.matched_shares == 0:
             return 0.0
-        return self.cost_yes / self.shares_yes
+        return (self.matched_cost_yes + self.matched_cost_no) / self.matched_shares
 
-    @property
-    def avg_price_no(self) -> float:
-        """Average price paid per NO share."""
-        if self.shares_no == 0:
-            return 0.0
-        return self.cost_no / self.shares_no
-
-    @property
-    def matched_shares(self) -> float:
-        """Number of matched YES+NO pairs."""
-        return min(self.shares_yes, self.shares_no)
-
-    @property
-    def locked_profit(self) -> float:
-        """
-        Guaranteed profit from matched pairs.
-        Each matched pair pays $1. Profit = $1 * matched - cost_of_matched.
-        """
-        matched = self.matched_shares
-        if matched == 0:
-            return 0.0
-
-        # Cost of matched shares
-        # Use proportional cost based on shares used
-        cost_matched_yes = (matched / self.shares_yes) * self.cost_yes if self.shares_yes > 0 else 0
-        cost_matched_no = (matched / self.shares_no) * self.cost_no if self.shares_no > 0 else 0
-
-        total_cost = cost_matched_yes + cost_matched_no
-        payout = matched * 1.00
-
-        return payout - total_cost
-
-    @property
-    def unmatched_yes(self) -> float:
-        """Unmatched YES shares (at risk)."""
-        return max(0, self.shares_yes - self.shares_no)
-
-    @property
-    def unmatched_no(self) -> float:
-        """Unmatched NO shares (at risk)."""
-        return max(0, self.shares_no - self.shares_yes)
-
-    @property
-    def total_exposure(self) -> float:
-        """Total $ at risk (unmatched positions)."""
-        # Unmatched shares have potential to lose their full cost
-        if self.shares_yes > self.shares_no:
-            unmatched_cost = (self.unmatched_yes / self.shares_yes) * self.cost_yes if self.shares_yes > 0 else 0
-        else:
-            unmatched_cost = (self.unmatched_no / self.shares_no) * self.cost_no if self.shares_no > 0 else 0
-        return unmatched_cost
-
-    def add_yes(self, shares: float, price: float, trade_size: float):
-        """Add YES shares to position."""
-        self.shares_yes += shares
-        self.cost_yes += trade_size
-        self.last_yes_trade = datetime.now(timezone.utc)  # v2: track cooldown
+    def add_yes_lot(self, shares: float, price: float) -> None:
+        """Add a new YES purchase lot."""
+        now = datetime.now(timezone.utc)
+        self.unmatched_yes_lots.append(ShareLot(shares, price, now))
+        self.last_yes_trade_time = now
         self.trades.append({
-            'time': datetime.now(timezone.utc).isoformat(),
+            'time': now.isoformat(),
             'side': 'YES',
             'shares': shares,
             'price': price,
-            'cost': trade_size,
+            'cost': shares * price,
+            'type': 'buy',
         })
 
-    def add_no(self, shares: float, price: float, trade_size: float):
-        """Add NO shares to position."""
-        self.shares_no += shares
-        self.cost_no += trade_size
-        self.last_no_trade = datetime.now(timezone.utc)  # v2: track cooldown
+    def add_no_lot(self, shares: float, price: float) -> None:
+        """Add a new NO purchase lot."""
+        now = datetime.now(timezone.utc)
+        self.unmatched_no_lots.append(ShareLot(shares, price, now))
+        self.last_no_trade_time = now
         self.trades.append({
-            'time': datetime.now(timezone.utc).isoformat(),
+            'time': now.isoformat(),
             'side': 'NO',
             'shares': shares,
             'price': price,
-            'cost': trade_size,
+            'cost': shares * price,
+            'type': 'buy',
         })
 
+    def match_shares(self) -> Tuple[float, float]:
+        """
+        Match unmatched YES and NO shares using FIFO.
+        Returns (shares_matched, profit_locked).
 
-@dataclass
-class PriceHistory:
-    """Price history for a market."""
-    yes_prices: deque = field(default_factory=lambda: deque(maxlen=100))
-    no_prices: deque = field(default_factory=lambda: deque(maxlen=100))
-    timestamps: deque = field(default_factory=lambda: deque(maxlen=100))
+        IMPORTANT: Only matches pairs where combined cost < $1.00 (profitable).
+        Unprofitable pairs are left unmatched to avoid locking in losses.
+        """
+        total_matched = 0.0
+        newly_locked_profit = 0.0
 
-    def add(self, yes_price: float, no_price: float):
-        """Add price observation."""
-        self.yes_prices.append(yes_price)
-        self.no_prices.append(no_price)
-        self.timestamps.append(datetime.now(timezone.utc))
+        while self.unmatched_yes_lots and self.unmatched_no_lots:
+            yes_lot = self.unmatched_yes_lots[0]
+            no_lot = self.unmatched_no_lots[0]
 
-    def ma_yes(self, periods: int = 20) -> Optional[float]:
-        """Moving average of YES prices."""
-        if len(self.yes_prices) < periods:
-            return None
-        recent = list(self.yes_prices)[-periods:]
-        return sum(recent) / len(recent)
+            # Calculate cost basis for this potential match
+            yes_cost_per_share = yes_lot.price
+            no_cost_per_share = no_lot.price
+            combined_cost_per_share = yes_cost_per_share + no_cost_per_share
 
-    def ma_no(self, periods: int = 20) -> Optional[float]:
-        """Moving average of NO prices."""
-        if len(self.no_prices) < periods:
-            return None
-        recent = list(self.no_prices)[-periods:]
-        return sum(recent) / len(recent)
+            # CRITICAL: Only match if profitable (combined < $1.00)
+            if combined_cost_per_share >= 1.0:
+                # Skip this pair - it would lock in a loss
+                # Leave both lots unmatched, hoping prices improve
+                break
+
+            # Match the smaller of the two lots
+            shares_to_match = min(yes_lot.shares, no_lot.shares)
+
+            if shares_to_match < 0.001:  # Skip tiny amounts
+                break
+
+            # Calculate profit (guaranteed positive since combined < $1)
+            profit_per_share = 1.0 - combined_cost_per_share
+            profit = shares_to_match * profit_per_share
+
+            # Update matched totals
+            self.matched_shares += shares_to_match
+            self.matched_cost_yes += shares_to_match * yes_cost_per_share
+            self.matched_cost_no += shares_to_match * no_cost_per_share
+            self.locked_profit += profit
+            newly_locked_profit += profit
+            total_matched += shares_to_match
+
+            # Reduce lot sizes
+            yes_lot.shares -= shares_to_match
+            no_lot.shares -= shares_to_match
+
+            # Remove depleted lots
+            if yes_lot.shares < 0.001:
+                self.unmatched_yes_lots.pop(0)
+            if no_lot.shares < 0.001:
+                self.unmatched_no_lots.pop(0)
+
+            # Record match
+            self.trades.append({
+                'time': datetime.now(timezone.utc).isoformat(),
+                'type': 'match',
+                'shares': shares_to_match,
+                'yes_price': yes_cost_per_share,
+                'no_price': no_cost_per_share,
+                'combined': combined_cost_per_share,
+                'profit_locked': profit,
+            })
+
+        return total_matched, newly_locked_profit
+
+    def remove_yes_shares(self, shares: float, price: float) -> float:
+        """Remove YES shares (for selling). Returns actual shares removed."""
+        removed = 0.0
+        while shares > 0.001 and self.unmatched_yes_lots:
+            lot = self.unmatched_yes_lots[0]
+            take = min(lot.shares, shares)
+            lot.shares -= take
+            shares -= take
+            removed += take
+            if lot.shares < 0.001:
+                self.unmatched_yes_lots.pop(0)
+
+        self.trades.append({
+            'time': datetime.now(timezone.utc).isoformat(),
+            'side': 'YES',
+            'shares': removed,
+            'price': price,
+            'type': 'sell',
+        })
+        return removed
+
+    def remove_no_shares(self, shares: float, price: float) -> float:
+        """Remove NO shares (for selling). Returns actual shares removed."""
+        removed = 0.0
+        while shares > 0.001 and self.unmatched_no_lots:
+            lot = self.unmatched_no_lots[0]
+            take = min(lot.shares, shares)
+            lot.shares -= take
+            shares -= take
+            removed += take
+            if lot.shares < 0.001:
+                self.unmatched_no_lots.pop(0)
+
+        self.trades.append({
+            'time': datetime.now(timezone.utc).isoformat(),
+            'side': 'NO',
+            'shares': removed,
+            'price': price,
+            'type': 'sell',
+        })
+        return removed
 
 
 class GabagoolStrategy:
     """
-    Asymmetric scalping - buy dips on BOTH sides independently.
-    Goal: accumulate positions where avg_cost_yes + avg_cost_no < 1.00
+    Opportunistic Dip-Buying Strategy v4.
 
     Parameters:
-        dip_threshold: Buy when price < MA * (1 - threshold). Default 5%.
-        lookback_periods: Periods for moving average. Default 60 (was 20).
-        min_periods: Minimum observations before trading. Default 30 (was 10).
-        max_position_per_side: Max $ to invest per side per market. Default $50 (was $100).
-        trade_cooldown_seconds: Minimum seconds between same-side trades. Default 30.
-        min_time_left_minutes: Stop trading when less than this many minutes left. Default 3.
-        imbalance_threshold: If one side has > this ratio more cost, only buy other side. Default 1.5.
+        yes_buy_threshold: Buy YES when below this price (default 0.48)
+        no_buy_threshold: Buy NO when below this price (default 0.48)
+        use_moving_average: Also check MA for dip detection
+        ma_window_seconds: MA calculation window (default 30s)
+        dip_below_ma_pct: Buy when this % below MA (default 0.03 = 3%)
+        trade_size: $ per individual buy (default $10)
+        max_unmatched_cost: Max $ unmatched per side (default $50)
+        max_position_cost: Total max $ per market (default $200)
+        cooldown_seconds: Per-side cooldown (default 5s)
+        close_before_expiry_mins: Close unmatched before expiry (default 2 min)
     """
 
     def __init__(
         self,
-        dip_threshold: float = 0.05,
-        lookback_periods: int = 60,  # v2: increased from 20
-        min_periods: int = 30,  # v2: increased from 10
-        max_position_per_side: float = 50.0,  # v2: reduced from 100
-        trade_cooldown_seconds: float = 30.0,  # v2: new
-        min_time_left_minutes: float = 3.0,  # v2: new
-        imbalance_threshold: float = 1.5,  # v2: new
+        yes_buy_threshold: float = 0.48,
+        no_buy_threshold: float = 0.48,
+        use_moving_average: bool = True,
+        ma_window_seconds: float = 30.0,
+        dip_below_ma_pct: float = 0.03,
+        trade_size: float = 10.0,
+        max_unmatched_cost: float = 50.0,
+        max_position_cost: float = 200.0,
+        cooldown_seconds: float = 5.0,
+        close_before_expiry_mins: float = 2.0,
     ):
-        self.dip_threshold = dip_threshold
-        self.lookback = lookback_periods
-        self.min_periods = min_periods
-        self.max_position_per_side = max_position_per_side
-        self.trade_cooldown = timedelta(seconds=trade_cooldown_seconds)  # v2
-        self.min_time_left = timedelta(minutes=min_time_left_minutes)  # v2
-        self.imbalance_threshold = imbalance_threshold  # v2
+        self.yes_buy_threshold = yes_buy_threshold
+        self.no_buy_threshold = no_buy_threshold
+        self.use_moving_average = use_moving_average
+        self.ma_window_seconds = ma_window_seconds
+        self.dip_below_ma_pct = dip_below_ma_pct
+        self.trade_size = trade_size
+        self.max_unmatched_cost = max_unmatched_cost
+        self.max_position_cost = max_position_cost
+        self.cooldown = timedelta(seconds=cooldown_seconds)
+        self.close_before_expiry = timedelta(minutes=close_before_expiry_mins)
 
         # Per-market tracking
-        self.positions: Dict[str, GabagoolPosition] = {}
-        self.price_history: Dict[str, PriceHistory] = {}
+        self.positions: Dict[str, DipBuyPosition] = {}
 
         # Stats
-        self.total_yes_buys = 0
-        self.total_no_buys = 0
+        self.total_trades = 0
+        self.total_profit_locked = 0.0
 
-    def get_or_create_position(self, market_id: str, asset: str) -> GabagoolPosition:
+    def get_or_create_position(self, market_id: str, asset: str) -> DipBuyPosition:
         """Get or create position for a market."""
         if market_id not in self.positions:
-            self.positions[market_id] = GabagoolPosition(
+            self.positions[market_id] = DipBuyPosition(
                 market_id=market_id,
                 asset=asset,
             )
         return self.positions[market_id]
 
-    def get_or_create_history(self, market_id: str) -> PriceHistory:
-        """Get or create price history for a market."""
-        if market_id not in self.price_history:
-            self.price_history[market_id] = PriceHistory()
-        return self.price_history[market_id]
+    def _update_price_history(
+        self,
+        position: DipBuyPosition,
+        yes_price: float,
+        no_price: float,
+        now: datetime,
+    ) -> None:
+        """Update price history and trim old entries."""
+        position.yes_price_history.append((now, yes_price))
+        position.no_price_history.append((now, no_price))
+
+        # Trim old entries (keep 2x MA window for safety)
+        cutoff = now - timedelta(seconds=self.ma_window_seconds * 2)
+        position.yes_price_history = [
+            (ts, p) for ts, p in position.yes_price_history if ts >= cutoff
+        ]
+        position.no_price_history = [
+            (ts, p) for ts, p in position.no_price_history if ts >= cutoff
+        ]
+
+    def _calculate_ma(
+        self,
+        history: List[Tuple[datetime, float]],
+        now: datetime,
+    ) -> Optional[float]:
+        """Calculate moving average from recent price history."""
+        cutoff = now - timedelta(seconds=self.ma_window_seconds)
+        recent = [price for ts, price in history if ts >= cutoff]
+
+        if len(recent) < 5:  # Need minimum data points
+            return None
+
+        return sum(recent) / len(recent)
+
+    def _check_dip_signal(
+        self,
+        position: DipBuyPosition,
+        side: str,
+        current_price: float,
+        now: datetime,
+    ) -> bool:
+        """Check if current price represents a dip worth buying.
+
+        IMPORTANT: Price MUST be at or below the absolute threshold.
+        MA dip detection is only used as an additional filter when below threshold.
+        This prevents buying at high prices that would create unprofitable matches.
+        """
+        threshold = self.yes_buy_threshold if side == 'YES' else self.no_buy_threshold
+
+        # Hard cap: NEVER buy above threshold (prevents >100% combined matches)
+        if current_price > threshold:
+            return False
+
+        # Below threshold - either buy on simple threshold or MA dip
+        if not self.use_moving_average:
+            # Simple mode: buy whenever below threshold
+            return True
+
+        # MA mode: prefer to buy when it's also an MA dip (extra confirmation)
+        history = (position.yes_price_history if side == 'YES'
+                   else position.no_price_history)
+        ma = self._calculate_ma(history, now)
+
+        if ma is None:
+            # Not enough data for MA - fall back to threshold
+            return True
+
+        # Buy if price is below MA (dip) or significantly below threshold
+        dip_threshold = ma * (1 - self.dip_below_ma_pct)
+        if current_price < dip_threshold:
+            return True
+
+        # Also buy if we're well below threshold even if not an MA dip
+        if current_price < threshold * 0.95:
+            return True
+
+        return False
+
+    def _can_buy_yes(self, position: DipBuyPosition, now: datetime) -> bool:
+        """Check if we can buy YES (cooldown and limits)."""
+        # Cooldown check
+        if position.last_yes_trade_time is not None:
+            if now - position.last_yes_trade_time < self.cooldown:
+                return False
+
+        # Unmatched limit
+        if position.unmatched_yes_cost >= self.max_unmatched_cost:
+            return False
+
+        # Total position limit
+        if position.total_cost >= self.max_position_cost:
+            return False
+
+        return True
+
+    def _can_buy_no(self, position: DipBuyPosition, now: datetime) -> bool:
+        """Check if we can buy NO (cooldown and limits)."""
+        # Cooldown check
+        if position.last_no_trade_time is not None:
+            if now - position.last_no_trade_time < self.cooldown:
+                return False
+
+        # Unmatched limit
+        if position.unmatched_no_cost >= self.max_unmatched_cost:
+            return False
+
+        # Total position limit
+        if position.total_cost >= self.max_position_cost:
+            return False
+
+        return True
 
     def on_price_update(
         self,
@@ -235,185 +423,145 @@ class GabagoolStrategy:
         asset: str,
         yes_price: float,
         no_price: float,
-        trade_size: float = 10.0,
-        time_left: timedelta = None,  # v2: expiry awareness
+        time_left: timedelta = None,
     ) -> Tuple[GabagoolAction, Optional[dict]]:
         """
-        Process price update and decide action.
-
-        Args:
-            market_id: Unique market identifier
-            asset: Asset symbol (BTC, ETH, etc.)
-            yes_price: Current YES token price (0-1)
-            no_price: Current NO token price (0-1)
-            trade_size: $ amount per trade
-            time_left: Time remaining until market expiry (v2)
+        Main strategy method - check for dip opportunities.
 
         Returns:
             Tuple of (action, trade_details or None)
         """
         now = datetime.now(timezone.utc)
-
-        # Update price history
-        history = self.get_or_create_history(market_id)
-        history.add(yes_price, no_price)
-
-        # Need minimum observations
-        if len(history.yes_prices) < self.min_periods:
-            return GabagoolAction.HOLD, None
-
-        # v2: Check expiry - stop trading near market end
-        if time_left is not None and time_left < self.min_time_left:
-            return GabagoolAction.HOLD, None
-
-        # Get position
         position = self.get_or_create_position(market_id, asset)
 
-        # Calculate MAs
-        ma_yes = history.ma_yes(self.lookback)
-        ma_no = history.ma_no(self.lookback)
+        # Update price history
+        self._update_price_history(position, yes_price, no_price, now)
 
-        if ma_yes is None or ma_no is None:
+        # Try to match any unmatched shares
+        matched, profit = position.match_shares()
+        if matched > 0:
+            self.total_profit_locked += profit
+
+        # Check if we need to close unmatched before expiry
+        if time_left is not None and time_left < self.close_before_expiry:
+            return self._check_close_unmatched(position, yes_price, no_price)
+
+        # Skip new buys if market closing soon (< 3 min)
+        if time_left is not None and time_left < timedelta(minutes=3):
             return GabagoolAction.HOLD, None
 
-        # Check for dips
-        yes_dip_target = ma_yes * (1 - self.dip_threshold)
-        no_dip_target = ma_no * (1 - self.dip_threshold)
+        # Check for dip opportunities
+        yes_dip = self._check_dip_signal(position, 'YES', yes_price, now)
+        no_dip = self._check_dip_signal(position, 'NO', no_price, now)
 
-        yes_is_dip = yes_price < yes_dip_target
-        no_is_dip = no_price < no_dip_target
-
-        # v2: Check cooldowns
-        yes_on_cooldown = (
-            position.last_yes_trade is not None and
-            (now - position.last_yes_trade) < self.trade_cooldown
-        )
-        no_on_cooldown = (
-            position.last_no_trade is not None and
-            (now - position.last_no_trade) < self.trade_cooldown
-        )
-
-        # v2: Check max position limits
-        yes_maxed = position.cost_yes >= self.max_position_per_side
-        no_maxed = position.cost_no >= self.max_position_per_side
-
-        # v2: Can we buy each side?
-        can_buy_yes = yes_is_dip and not yes_on_cooldown and not yes_maxed
-        can_buy_no = no_is_dip and not no_on_cooldown and not no_maxed
-
-        if not can_buy_yes and not can_buy_no:
-            return GabagoolAction.HOLD, None
-
-        # v2: Calculate imbalance and determine which side to prioritize
-        # If one side is significantly larger, ONLY buy the smaller side
-        yes_cost = position.cost_yes
-        no_cost = position.cost_no
-
-        # Determine which side needs more buying based on imbalance
-        force_yes_only = False
-        force_no_only = False
-
-        if yes_cost > 0 and no_cost > 0:
-            if yes_cost / no_cost > self.imbalance_threshold:
-                # YES is too heavy, only buy NO
-                force_no_only = True
-            elif no_cost / yes_cost > self.imbalance_threshold:
-                # NO is too heavy, only buy YES
-                force_yes_only = True
-        elif yes_cost > 0 and no_cost == 0:
-            # Have YES but no NO - strongly prefer NO
-            force_no_only = True
-        elif no_cost > 0 and yes_cost == 0:
-            # Have NO but no YES - strongly prefer YES
-            force_yes_only = True
-
-        # Apply imbalance rules
-        if force_no_only and can_buy_no:
-            can_buy_yes = False
-        elif force_yes_only and can_buy_yes:
-            can_buy_no = False
-
-        # Decide action
-        action = GabagoolAction.HOLD
-        trade_info = None
-
-        if can_buy_yes and can_buy_no:
-            # Both sides available - buy the bigger dip
-            yes_dip_pct = (ma_yes - yes_price) / ma_yes
-            no_dip_pct = (ma_no - no_price) / ma_no
-
-            if no_dip_pct > yes_dip_pct:
-                # Buy NO
-                shares = trade_size / no_price
-                position.add_no(shares, no_price, trade_size)
-                action = GabagoolAction.BUY_NO
-                self.total_no_buys += 1
-                trade_info = {
-                    'side': 'NO',
-                    'price': no_price,
-                    'shares': shares,
-                    'cost': trade_size,
-                    'ma': ma_no,
-                    'dip_pct': no_dip_pct,
-                }
+        # Prioritize the side with bigger dip (lower price = bigger opportunity)
+        # Or prioritize the side that helps balance unmatched positions
+        if yes_dip and no_dip:
+            # Both sides dipping - buy the one we have less of (to balance)
+            if position.unmatched_yes_shares <= position.unmatched_no_shares:
+                if self._can_buy_yes(position, now):
+                    return self._execute_buy_yes(position, yes_price)
             else:
-                # Buy YES
-                shares = trade_size / yes_price
-                position.add_yes(shares, yes_price, trade_size)
-                action = GabagoolAction.BUY_YES
-                self.total_yes_buys += 1
-                trade_info = {
-                    'side': 'YES',
-                    'price': yes_price,
-                    'shares': shares,
-                    'cost': trade_size,
-                    'ma': ma_yes,
-                    'dip_pct': yes_dip_pct,
-                }
-        elif can_buy_yes:
-            # Only YES available
-            shares = trade_size / yes_price
-            position.add_yes(shares, yes_price, trade_size)
-            action = GabagoolAction.BUY_YES
-            self.total_yes_buys += 1
-            trade_info = {
+                if self._can_buy_no(position, now):
+                    return self._execute_buy_no(position, no_price)
+
+        # Single side dip
+        if yes_dip and self._can_buy_yes(position, now):
+            return self._execute_buy_yes(position, yes_price)
+
+        if no_dip and self._can_buy_no(position, now):
+            return self._execute_buy_no(position, no_price)
+
+        return GabagoolAction.HOLD, None
+
+    def _execute_buy_yes(
+        self,
+        position: DipBuyPosition,
+        price: float,
+    ) -> Tuple[GabagoolAction, dict]:
+        """Execute a YES buy."""
+        shares = self.trade_size / price
+        cost = shares * price
+
+        # Update position (actual execution happens in engine)
+        position.add_yes_lot(shares, price)
+        self.total_trades += 1
+
+        # Try to match after buy
+        matched, profit = position.match_shares()
+        if matched > 0:
+            self.total_profit_locked += profit
+
+        return GabagoolAction.BUY_YES, {
+            'side': 'YES',
+            'shares': shares,
+            'price': price,
+            'cost': cost,
+            'unmatched_yes': position.unmatched_yes_shares,
+            'unmatched_no': position.unmatched_no_shares,
+            'matched': matched,
+            'locked_profit': profit,
+        }
+
+    def _execute_buy_no(
+        self,
+        position: DipBuyPosition,
+        price: float,
+    ) -> Tuple[GabagoolAction, dict]:
+        """Execute a NO buy."""
+        shares = self.trade_size / price
+        cost = shares * price
+
+        # Update position (actual execution happens in engine)
+        position.add_no_lot(shares, price)
+        self.total_trades += 1
+
+        # Try to match after buy
+        matched, profit = position.match_shares()
+        if matched > 0:
+            self.total_profit_locked += profit
+
+        return GabagoolAction.BUY_NO, {
+            'side': 'NO',
+            'shares': shares,
+            'price': price,
+            'cost': cost,
+            'unmatched_yes': position.unmatched_yes_shares,
+            'unmatched_no': position.unmatched_no_shares,
+            'matched': matched,
+            'locked_profit': profit,
+        }
+
+    def _check_close_unmatched(
+        self,
+        position: DipBuyPosition,
+        yes_price: float,
+        no_price: float,
+    ) -> Tuple[GabagoolAction, Optional[dict]]:
+        """Check if we need to close unmatched positions before expiry."""
+        # Sell unmatched YES first (if any)
+        if position.unmatched_yes_shares > 0.01:
+            shares = position.unmatched_yes_shares
+            return GabagoolAction.SELL_YES, {
                 'side': 'YES',
+                'shares': shares,
                 'price': yes_price,
-                'shares': shares,
-                'cost': trade_size,
-                'ma': ma_yes,
-                'dip_pct': (ma_yes - yes_price) / ma_yes,
+                'proceeds': shares * yes_price,
+                'reason': 'close_before_expiry',
             }
-        elif can_buy_no:
-            # Only NO available
-            shares = trade_size / no_price
-            position.add_no(shares, no_price, trade_size)
-            action = GabagoolAction.BUY_NO
-            self.total_no_buys += 1
-            trade_info = {
+
+        # Then sell unmatched NO (if any)
+        if position.unmatched_no_shares > 0.01:
+            shares = position.unmatched_no_shares
+            return GabagoolAction.SELL_NO, {
                 'side': 'NO',
-                'price': no_price,
                 'shares': shares,
-                'cost': trade_size,
-                'ma': ma_no,
-                'dip_pct': (ma_no - no_price) / ma_no,
+                'price': no_price,
+                'proceeds': shares * no_price,
+                'reason': 'close_before_expiry',
             }
 
-        return action, trade_info
-
-    def calculate_locked_profit(self, market_id: str) -> float:
-        """Get locked profit for a market."""
-        if market_id not in self.positions:
-            return 0.0
-        return self.positions[market_id].locked_profit
-
-    def get_total_locked_profit(self) -> float:
-        """Total locked profit across all markets."""
-        return sum(pos.locked_profit for pos in self.positions.values())
-
-    def get_total_exposure(self) -> float:
-        """Total $ at risk from unmatched positions."""
-        return sum(pos.total_exposure for pos in self.positions.values())
+        return GabagoolAction.HOLD, None
 
     def get_position_summary(self, market_id: str) -> Optional[dict]:
         """Get position summary for a market."""
@@ -421,52 +569,70 @@ class GabagoolStrategy:
             return None
 
         pos = self.positions[market_id]
+
+        # Calculate pair economics for visualization
+        avg_yes_price = pos.matched_cost_yes / pos.matched_shares if pos.matched_shares > 0 else 0
+        avg_no_price = pos.matched_cost_no / pos.matched_shares if pos.matched_shares > 0 else 0
+        combined_cost = avg_yes_price + avg_no_price
+        profit_margin = (1 - combined_cost) if pos.matched_shares > 0 else 0
+
         return {
             'market_id': market_id,
             'asset': pos.asset,
-            'shares_yes': pos.shares_yes,
-            'shares_no': pos.shares_no,
-            'avg_price_yes': pos.avg_price_yes,
-            'avg_price_no': pos.avg_price_no,
-            'cost_yes': pos.cost_yes,
-            'cost_no': pos.cost_no,
+            'unmatched_yes_shares': pos.unmatched_yes_shares,
+            'unmatched_no_shares': pos.unmatched_no_shares,
+            'unmatched_yes_cost': pos.unmatched_yes_cost,
+            'unmatched_no_cost': pos.unmatched_no_cost,
             'matched_shares': pos.matched_shares,
+            'matched_cost_yes': pos.matched_cost_yes,
+            'matched_cost_no': pos.matched_cost_no,
             'locked_profit': pos.locked_profit,
-            'unmatched_yes': pos.unmatched_yes,
-            'unmatched_no': pos.unmatched_no,
-            'total_exposure': pos.total_exposure,
+            'total_cost': pos.total_cost,
+            'unrealized_risk': pos.unrealized_risk,
+            'num_trades': len(pos.trades),
+            # Pair economics for dashboard visualization
+            'avg_yes_price': avg_yes_price,
+            'avg_no_price': avg_no_price,
+            'combined_cost': combined_cost,
+            'profit_margin': profit_margin,
         }
 
+    def get_total_locked_profit(self) -> float:
+        """Total locked profit across all markets."""
+        return sum(pos.locked_profit for pos in self.positions.values())
+
+    def get_total_cost(self) -> float:
+        """Total cost across all markets."""
+        return sum(pos.total_cost for pos in self.positions.values())
+
+    def get_total_unrealized_risk(self) -> float:
+        """Total unmatched cost (at risk) across all markets."""
+        return sum(pos.unrealized_risk for pos in self.positions.values())
+
     def clear_expired_market(self, market_id: str) -> Optional[dict]:
-        """
-        Clear position for an expired market and return final P&L.
-        Called when market resolves.
-        """
+        """Clear position for an expired market."""
         if market_id not in self.positions:
             return None
 
         pos = self.positions[market_id]
         summary = self.get_position_summary(market_id)
 
-        # The locked profit is guaranteed
-        # Unmatched shares result in loss of their cost
-        summary['final_pnl'] = pos.locked_profit - pos.total_exposure
+        # Final P&L = locked profit (guaranteed)
+        # Note: unmatched positions either won or lost at resolution
+        summary['final_pnl'] = pos.locked_profit
+        summary['payout'] = pos.matched_shares  # $1 per matched share
 
-        # Clean up
         del self.positions[market_id]
-        if market_id in self.price_history:
-            del self.price_history[market_id]
-
         return summary
 
     def get_stats(self) -> dict:
         """Get overall strategy stats."""
         return {
-            'total_yes_buys': self.total_yes_buys,
-            'total_no_buys': self.total_no_buys,
+            'total_trades': self.total_trades,
+            'total_profit_locked': self.total_profit_locked,
+            'total_cost': self.get_total_cost(),
+            'total_unrealized_risk': self.get_total_unrealized_risk(),
             'active_markets': len(self.positions),
-            'total_locked_profit': self.get_total_locked_profit(),
-            'total_exposure': self.get_total_exposure(),
             'positions': {
                 mid: self.get_position_summary(mid)
                 for mid in self.positions.keys()
@@ -474,36 +640,54 @@ class GabagoolStrategy:
         }
 
 
-if __name__ == "__main__":
-    # Simple test
-    strategy = GabagoolStrategy(dip_threshold=0.05, lookback_periods=10, min_periods=5)
+# Backwards compatibility
+ArbitragePosition = DipBuyPosition
+GabagoolPosition = DipBuyPosition
 
-    # Simulate price updates
+
+if __name__ == "__main__":
+    # Test the strategy
+    strategy = GabagoolStrategy(
+        yes_buy_threshold=0.48,
+        no_buy_threshold=0.48,
+        trade_size=10.0,
+    )
+
     market_id = "test_market"
     asset = "BTC"
 
-    # Build up price history
-    for i in range(10):
-        yes_price = 0.50 + (i % 3) * 0.01  # Oscillate
-        no_price = 0.50 - (i % 3) * 0.01
-        action, info = strategy.on_price_update(market_id, asset, yes_price, no_price)
-        print(f"Tick {i}: YES={yes_price:.3f} NO={no_price:.3f} -> {action.value}")
+    print("=== Testing v4 Dip-Buy Strategy ===\n")
 
-    # Simulate a dip
-    print("\n--- Simulating YES dip ---")
-    action, info = strategy.on_price_update(market_id, asset, 0.42, 0.52)
-    print(f"Action: {action.value}")
+    # Simulate price updates
+    time_left = timedelta(minutes=10)
+
+    # No dip yet
+    action, info = strategy.on_price_update(market_id, asset, 0.52, 0.50, time_left)
+    print(f"Prices: YES=52¢ NO=50¢ -> {action.value}")
+
+    # YES dips below threshold
+    action, info = strategy.on_price_update(market_id, asset, 0.45, 0.52, time_left)
+    print(f"Prices: YES=45¢ NO=52¢ -> {action.value}")
     if info:
-        print(f"Trade: {info}")
+        print(f"  Bought {info['shares']:.2f} YES @ {info['price']:.2f}")
 
-    print("\n--- Simulating NO dip ---")
-    action, info = strategy.on_price_update(market_id, asset, 0.48, 0.44)
-    print(f"Action: {action.value}")
+    # Wait a bit (simulate cooldown passing)
+    import time
+    pos = strategy.positions[market_id]
+    pos.last_yes_trade_time = None  # Reset for test
+
+    # NO dips - should trigger matching
+    action, info = strategy.on_price_update(market_id, asset, 0.50, 0.46, time_left)
+    print(f"\nPrices: YES=50¢ NO=46¢ -> {action.value}")
     if info:
-        print(f"Trade: {info}")
+        print(f"  Bought {info['shares']:.2f} NO @ {info['price']:.2f}")
 
-    print("\n--- Position Summary ---")
-    print(strategy.get_position_summary(market_id))
-
-    print("\n--- Strategy Stats ---")
-    print(strategy.get_stats())
+    # Check position
+    print("\n=== Position Summary ===")
+    summary = strategy.get_position_summary(market_id)
+    if summary:
+        print(f"  Matched shares: {summary['matched_shares']:.2f}")
+        print(f"  Locked profit: ${summary['locked_profit']:.2f}")
+        print(f"  Unmatched YES: {summary['unmatched_yes_shares']:.2f}")
+        print(f"  Unmatched NO: {summary['unmatched_no_shares']:.2f}")
+        print(f"  Total cost: ${summary['total_cost']:.2f}")
